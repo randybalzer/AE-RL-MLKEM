@@ -1,41 +1,31 @@
-# Install dependencies if needed (run once in Colab)
-!pip install torch torchvision stable-baselines3 gymnasium numpy pandas
-
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
+from torch.distributions import Normal
 import numpy as np
-import gymnasium as gym
-from gymnasium import spaces
-from stable_baselines3 import PPO
-from stable_baselines3.common.vec_env import SubprocVecEnv
 import pandas as pd
 import os
 import torch.quantization as quantization
 import warnings
 
-# Suppress deprecation warnings
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
 
 # Step 1: Simulate ML-KEM Key Generation Traces
-# Simplified simulation: Traces are 100-dim vectors (e.g., NTT cycles, sampling times)
-# Params: n (dim), q (modulus), sigma (Gaussian std)
-# Latency ~ O(n log n) for NTT + sampling cost
 def simulate_key_gen(n, q, sigma, security_level):
-    # Simulated compute: NTT (FFT-like) + Gaussian sampling
+    
+    n = max(2, n)  # Avoid log2(1) or less
     ntt_time = n * np.log2(n) * 0.01  # ms, arbitrary scaling
     sampling_time = sigma * n * 0.005
     total_latency = ntt_time + sampling_time
-    # Security: Simplified bit-security estimate (NIST baselines: 128,192,256 for levels 1,3,5)
     bit_security = min(128 + 64*(security_level-1), np.log2(q) * n / sigma)
-    # Trace: High-dim vector (e.g., per-poly coeffs timings)
     trace = np.random.normal(total_latency, sigma, 100)  # 100-dim synthetic trace
     return trace, total_latency, bit_security
 
 # Generate dataset for each security level
-def generate_traces(num_traces=1000):
+def generate_traces(num_traces=100):  # Reduced for faster execution
+    
     levels = [1, 3, 5]
     params = [(256, 3329, 2.0), (512, 7681, 3.0), (768, 12289, 4.0)]  # NIST-inspired
     all_traces, all_latencies, all_securities = [], [], []
@@ -52,8 +42,9 @@ print(f"Generated {len(traces)} traces. Baseline avg latency: {np.mean(latencies
 
 # Step 2: Autoencoder for Trace Compression (100D -> 8D latent)
 class Autoencoder(nn.Module):
+    
     def __init__(self, input_dim=100, latent_dim=8):
-        super(Autoencoder, self).__init__()
+        super().__init__()
         self.encoder = nn.Sequential(
             nn.Linear(input_dim, 64), nn.ReLU(),
             nn.Linear(64, 32), nn.ReLU(),
@@ -70,15 +61,9 @@ class Autoencoder(nn.Module):
         recon = self.decoder(latent)
         return recon, latent
 
-    def __getstate__(self):
-        return self.state_dict()
-
-    def __setstate__(self, state):
-        self.__init__()
-        self.load_state_dict(state)
-
-# Train Autoencoder (unquantized)
-def train_autoencoder(traces, epochs=10, batch_size=32):
+# Train Autoencoder
+def train_autoencoder(traces, epochs=5, batch_size=32):  # Reduced epochs for speed
+    
     dataset = TensorDataset(torch.tensor(traces, dtype=torch.float32))
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
     model = Autoencoder()
@@ -99,73 +84,118 @@ def train_autoencoder(traces, epochs=10, batch_size=32):
 
 ae_model = train_autoencoder(traces)
 
-# Step 3: Gymnasium Environment for PPO
-class KeyGenEnv(gym.Env):
-    def __init__(self, ae_model, baseline_latencies, baseline_securities):
-        super(KeyGenEnv, self).__init__()
-        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(8,), dtype=np.float32)
-        self.action_space = spaces.Box(low=np.array([128, 2000, 1.0], dtype=np.float32), high=np.array([1024, 16384, 5.0], dtype=np.float32), shape=(3,))
-        self.ae_model = ae_model
-        self.baseline_lat = np.mean(baseline_latencies)
-        self.baseline_sec = np.mean(baseline_securities)
-        self.current_trace = None
-
-    def reset(self, *, seed=None, options=None):
-        if seed is not None:
-            np.random.seed(seed)
-        self.current_trace = traces[np.random.randint(0, len(traces))]
-        with torch.no_grad():
-            latent = self.ae_model.encoder(torch.tensor(self.current_trace, dtype=torch.float32).unsqueeze(0)).detach()
-        obs = latent.squeeze().numpy().astype(np.float32)
-        info = {}
-        return obs, info
-
-    def step(self, action):
-        n, q, sigma = action
-        _, lat, sec = simulate_key_gen(int(n), int(q), sigma, security_level=3)  # Avg level for sim
-        reward = -lat / self.baseline_lat  # Penalize latency
-        if sec < self.baseline_sec * 0.95:  # Enforce security (5% tolerance)
-            reward -= 100  # Heavy penalty
-        terminated = False  # Natural end (e.g., goal reached)
-        truncated = True   # Time limit or external end
-        info = {}
-        next_obs, _ = self.reset()
-        return next_obs, reward, terminated, truncated, info
-
-# Train PPO on CPU
-def train_ppo(ae_model, total_timesteps=10000):
-    env_fn = lambda: KeyGenEnv(ae_model, latencies, securities)
-    vec_env = SubprocVecEnv([env_fn])
-    model = PPO("MlpPolicy", vec_env, verbose=1, device='cpu')
-    model.learn(total_timesteps=total_timesteps)
+# Precompute latent representations
+def precompute_latents(ae_model, traces):
     
-    # Quantize policy after training
-    policy = model.policy
-    policy.eval()
-    quantized_policy = quantization.quantize_dynamic(policy, {nn.Linear}, dtype=torch.qint8)
-    torch.save(quantized_policy.state_dict(), 'ppo_quantized.pth')
-    policy_size = os.path.getsize('ppo_quantized.pth') / 1024
-    
-    # Quantize AE after training
     ae_model.eval()
-    quantized_ae = quantization.quantize_dynamic(ae_model, {nn.Linear}, dtype=torch.qint8)
-    torch.save(quantized_ae.state_dict(), 'ae_quantized.pth')
-    ae_size = os.path.getsize('ae_quantized.pth') / 1024
-    print(f"Quantized PPO model size: {policy_size:.2f} KB (Total framework: {policy_size + ae_size:.2f} KB)")
-    
-    # Log reward history (access via logger)
-    return model, model.logger.get_log_dict()['train/ep_rew_mean'][-1] if 'train/ep_rew_mean' in model.logger.get_log_dict() else None
+    with torch.no_grad():
+        latents = ae_model.encoder(torch.tensor(traces, dtype=torch.float32)).numpy()
+    return latents
 
-ppo_model, last_reward = train_ppo(ae_model)
+latents = precompute_latents(ae_model, traces)
+
+# Step 3: Simple REINFORCE Policy Gradient
+class Policy(nn.Module):
+    
+    def __init__(self, state_dim, action_dim):
+        super().__init__()
+        self.fc1 = nn.Linear(state_dim, 64)
+        self.fc2 = nn.Linear(64, 32)
+        self.mu = nn.Linear(32, action_dim)
+        self.log_std = nn.Linear(32, action_dim)
+
+    def forward(self, x):
+        x = torch.relu(self.fc1(x))
+        x = torch.relu(self.fc2(x))
+        mu = self.mu(x)
+        log_std = self.log_std(x)
+        std = torch.exp(log_std)
+        return mu, std
+
+# Parameters
+state_dim = 8
+action_dim = 3
+lr = 0.0003
+epochs = 10
+batch_size = 32
+min_action = torch.tensor([128., 2000., 1.0])
+max_action = torch.tensor([1024., 16384., 5.0])
+
+# Initialize policy
+policy = Policy(state_dim, action_dim)
+optimizer = optim.Adam(policy.parameters(), lr=lr)
+
+baseline_lat = np.mean(latencies)
+baseline_sec = np.mean(securities)
+
+last_reward = 0
+
+# Training loop
+for epoch in range(epochs):
+    
+    states = []
+    log_probs = []
+    rewards = []
+    for _ in range(batch_size):
+        state_idx = np.random.randint(0, len(latents))
+        state = torch.tensor(latents[state_idx], dtype=torch.float32)
+        mu, std = policy(state)
+        dist = Normal(mu, std)
+        action = dist.sample()
+        action = torch.clamp(action, min_action, max_action)
+        log_prob = dist.log_prob(action).sum()
+        
+        n, q, sigma = action.detach().numpy()
+        _, lat, sec = simulate_key_gen(n, q, sigma, 3)
+        reward = -lat / baseline_lat
+        if sec < baseline_sec * 0.95:
+            reward -= 100
+        
+        states.append(state)
+        log_probs.append(log_prob)
+        rewards.append(reward)
+    
+    # Normalize rewards
+    rewards_np = np.array(rewards)
+    last_reward = np.mean(rewards_np)
+    rewards_norm = (rewards_np - np.mean(rewards_np)) / (np.std(rewards_np) + 1e-8)
+    rewards = torch.tensor(rewards_norm, dtype=torch.float32)
+    
+    # Loss
+    log_probs = torch.stack(log_probs)
+    loss = - (log_probs * rewards).mean()
+    
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+    
+    print(f"Epoch {epoch+1}/{epochs}, Loss: {loss.item():.4f}, Avg Reward: {last_reward:.4f}")
+
+# Quantize policy and AE
+policy.eval()
+quantized_policy = quantization.quantize_dynamic(policy, {nn.Linear}, dtype=torch.qint8)
+torch.save(quantized_policy.state_dict(), 'policy_quantized.pth')
+policy_size = os.path.getsize('policy_quantized.pth') / 1024
+
+ae_model.eval()
+quantized_ae = quantization.quantize_dynamic(ae_model, {nn.Linear}, dtype=torch.qint8)
+torch.save(quantized_ae.state_dict(), 'ae_quantized.pth')
+ae_size = os.path.getsize('ae_quantized.pth') / 1024
+
+print(f"Quantized Policy size: {policy_size:.2f} KB, AE {ae_size:.2f} KB (Total: {policy_size + ae_size:.2f} KB)")
 
 # Step 4: Evaluate and Log Metrics
-def evaluate(ppo_model, ae_model, num_episodes=100):
-    env = KeyGenEnv(ae_model, latencies, securities)
+def evaluate(policy, num_episodes=100):
+    
     opt_latencies, opt_securities = [], []
     for _ in range(num_episodes):
-        obs, _ = env.reset()
-        action, _ = ppo_model.predict(obs)
-        _, lat, sec = simulate_key_gen(*action, security_level=3)
+        state_idx = np.random.randint(0, len(latents))
+        state = torch.tensor(latents[state_idx], dtype=torch.float32)
+        mu, std = policy(state)
+        action = mu  # Use mean for evaluation
+        action = torch.clamp(action, min_action, max_action)
+        n, q, sigma = action.detach().numpy()
+        _, lat, sec = simulate_key_gen(n, q, sigma, 3)
         opt_latencies.append(lat)
         opt_securities.append(sec)
     
@@ -179,7 +209,7 @@ def evaluate(ppo_model, ae_model, num_episodes=100):
         'Optimized Latency (ms)': opt_lat,
         'Latency Reduction (%)': reduction,
         'Avg Security Score (bits)': avg_sec,
-        'Model Size (KB)': os.path.getsize('ae_quantized.pth')/1024 + os.path.getsize('ppo_quantized.pth')/1024
+        'Model Size (KB)': policy_size + ae_size
     }
     print("Evaluation Metrics:", metrics)
     
@@ -189,4 +219,4 @@ def evaluate(ppo_model, ae_model, num_episodes=100):
     df.to_csv('metrics.csv', index=False)
     print("Metrics logged to metrics.csv")
 
-evaluate(ppo_model, ae_model)
+evaluate(policy)
